@@ -16,7 +16,7 @@ Each skill scaffolds a complete, production-ready architecture from a single com
 ## Install a skill
 
 ```bash
-curl -o ~/.claude/commands/build-chat-widget.md \
+mkdir -p ~/.claude/commands && curl -o ~/.claude/commands/build-chat-widget.md \
   https://raw.githubusercontent.com/tekkstudio/skills/main/build-chat-widget.md
 ```
 

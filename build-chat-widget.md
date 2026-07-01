@@ -259,11 +259,79 @@ c. OpenSearchServerlessCollection  (Type: VECTORSEARCH)
 d. BedrockKBRole  (IAM role, AssumeRolePrincipal: bedrock.amazonaws.com)
    → Policies: s3:GetObject + s3:ListBucket on DataBucket, aoss:APIAccessAll on collection
 
+d2. IndexCreatorRole  (IAM role, AssumeRolePrincipal: lambda.amazonaws.com)
+    → ManagedPolicies: AWSLambdaBasicExecutionRole
+    → Policies: aoss:APIAccessAll on the collection ARN
+    ⚠️  This role needs BOTH the IAM permission above AND to be listed as a principal in
+    the DataAccessPolicy below. AOSS enforces both layers independently.
+
+d3. IndexCreatorFunction  (AWS::Lambda::Function — NOT AWS::Serverless::Function)
+    → Runtime: python3.12, Timeout: 120
+    → MUST use AWS::Lambda::Function with Code.ZipFile (not Serverless::Function) so the
+      cfnresponse module is available in the Lambda environment without packaging.
+    → On Create: PUTs the knn_vector index to the collection HTTP endpoint using SigV4.
+      Retries 6× with 10-second sleeps to handle AOSS readiness race after collection active.
+      Returns SUCCESS if index already exists (idempotent).
+    → On Update/Delete: returns SUCCESS immediately (no-op — never delete the index on stack delete).
+
+    Inline code (verbatim — emit this exactly inside Code.ZipFile):
+      import json,os,time,hashlib,cfnresponse,urllib.request as ur,urllib.error as ue,boto3
+      from botocore.auth import SigV4Auth
+      from botocore.awsrequest import AWSRequest
+      def handler(event,ctx):
+        if event['RequestType']!='Create':
+          cfnresponse.send(event,ctx,cfnresponse.SUCCESS,{});return
+        try:
+          p=event['ResourceProperties']
+          url=f"{p['CollectionEndpoint'].rstrip('/')}/{p['IndexName']}"
+          body=json.dumps({"settings":{"index.knn":True},"mappings":{"properties":{
+            p['VectorField']:{"type":"knn_vector","dimension":int(p.get('Dimension',1024)),"method":{"name":"hnsw","engine":"faiss","space_type":"l2","parameters":{"ef_construction":512,"m":16}}},
+            p['TextField']:{"type":"text","index":True},
+            p['MetadataField']:{"type":"text","index":False}}}}).encode()
+          last=None
+          for i in range(6):
+            try:
+              sha256=hashlib.sha256(body).hexdigest()
+              r=AWSRequest(method='PUT',url=url,data=body,headers={'Content-Type':'application/json','x-amz-content-sha256':sha256})
+              SigV4Auth(boto3.session.Session().get_credentials(),'aoss',os.environ.get('AWS_REGION','us-east-1')).add_auth(r)
+              req=ur.Request(url,data=body,method='PUT')
+              for k,v in r.headers.items():req.add_header(k,v)
+              ur.urlopen(req,timeout=30);last=None;break
+            except ue.HTTPError as e:
+              d=e.read()
+              if e.code==400 and b'resource_already_exists' in d:last=None;break
+              last=e
+            except Exception as e:last=e
+            if i<5:time.sleep(10)
+          if last:raise last
+          cfnresponse.send(event,ctx,cfnresponse.SUCCESS,{})
+        except Exception as e:
+          import traceback;print(traceback.format_exc())
+          cfnresponse.send(event,ctx,cfnresponse.FAILED,{'Error':str(e)})
+
 e. DataAccessPolicy  (Type: data)
-   → Grants BedrockKBRole: aoss:CreateIndex, DescribeIndex, ReadDocument, WriteDocument
-      on index/{collection-name}/*
-   → DependsOn: BedrockKBRole, OpenSearchServerlessCollection
+   → Grants BOTH BedrockKBRole AND IndexCreatorRole: aoss:CreateIndex, DescribeIndex,
+     ReadDocument, WriteDocument on index/{collection-name}/*
+   → DependsOn: BedrockKBRole, IndexCreatorRole, OpenSearchServerlessCollection
+   → Principal list in the JSON policy must include both role ARNs via !Sub
+
+f. BedrockKBIndex  (Type: Custom::OpenSearchIndex)
+   → ServiceToken: !GetAtt IndexCreatorFunction.Arn
+   → Properties: CollectionEndpoint (from !GetAtt collection.CollectionEndpoint),
+     IndexName, VectorField, TextField, MetadataField, Dimension ("1024")
+   ⚠️  Dimension MUST be "1024" for amazon.titan-embed-text-v2:0. "1536" is the v1 dimension.
+     Bedrock probes the index at KB creation time and fails immediately on a mismatch.
+   → DependsOn: DataAccessPolicy, IndexCreatorFunction
 ```
+
+⚠️  CRITICAL — always generate steps d2/d3/e/f above. Do NOT skip them.
+AWS::Bedrock::KnowledgeBase with OPENSEARCH_SERVERLESS storage calls the Bedrock API
+which immediately looks for the vector index in the collection. CloudFormation's
+AWS::OpenSearchServerless::Collection only creates the collection container, NOT the index.
+If BedrockKnowledgeBase depends on DataAccessPolicy directly (without the custom resource),
+the deploy will fail with: "no such index [bedrock-knowledge-base-default-index]".
+The AWS Console avoids this by creating the index silently during the KB wizard.
+CloudFormation does not. The custom resource chain above is the only correct fix.
 
 **6. Bedrock Knowledge Base — one per deployment, shared by all tenants**
 `core` scope uses a single shared KB. Every tenant's ChatApiFunction reads from the same
@@ -272,7 +340,7 @@ knowledge base ID. This is intentional — do not create per-tenant KBs.
 ```yaml
 BedrockKnowledgeBase:
   Type: AWS::Bedrock::KnowledgeBase
-  DependsOn: DataAccessPolicy
+  DependsOn: BedrockKBIndex
   Properties:
     Name: !Sub ${ProjectName}-${Environment}-kb
     RoleArn: !GetAtt BedrockKBRole.Arn
@@ -323,13 +391,14 @@ Outputs:
 Generate a complete executable shell script:
 ```bash
 #!/usr/bin/env bash
-# Usage: ./scripts/update-config.sh <compute-stack-name> [region]
-STACK=${1:?Usage: update-config.sh <compute-stack-name> [region]}
+# Usage: ./scripts/update-config.sh <compute-stack-name> [region] [profile]
+STACK=${1:?Usage: update-config.sh <compute-stack-name> [region] [profile]}
 REGION=${2:-us-east-1}
+PROFILE=${3:-default}
 
 get_output() {
   aws cloudformation describe-stacks \
-    --stack-name "$STACK" --region "$REGION" \
+    --stack-name "$STACK" --region "$REGION" --profile "$PROFILE" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
     --output text
 }
@@ -354,17 +423,20 @@ Generate a complete executable shell script that seeds both the CONFIG record an
 subscription so `SessionTokenFunction` will issue a token on first request:
 ```bash
 #!/usr/bin/env bash
-# Usage: ./scripts/seed-tenant.sh <infra-stack-name> [tenant-id] [region]
-STACK=${1:?Usage: seed-tenant.sh <infra-stack-name> [tenant-id] [region]}
+# Usage: ./scripts/seed-tenant.sh <infra-stack-name> [tenant-id] [region] [profile]
+STACK=${1:?Usage: seed-tenant.sh <infra-stack-name> [tenant-id] [region] [profile]}
 TENANT=${2:-test-tenant-id}
 REGION=${3:-us-east-1}
+PROFILE=${4:-default}
 
 CHAT_TABLE=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+  --profile "$PROFILE" \
   --query "Stacks[0].Outputs[?OutputKey=='ChatSessionTable'].OutputValue" --output text)
 SUB_TABLE=$(aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" \
+  --profile "$PROFILE" \
   --query "Stacks[0].Outputs[?OutputKey=='SubscriptionTable'].OutputValue" --output text)
 
-aws dynamodb put-item --table-name "$CHAT_TABLE" --region "$REGION" --item '{
+aws dynamodb put-item --table-name "$CHAT_TABLE" --region "$REGION" --profile "$PROFILE" --item '{
   "PK":             {"S": "TENANT#'"$TENANT"'"},
   "SK":             {"S": "CONFIG"},
   "allowedDomains": {"L": [{"S": "localhost"}]},
@@ -374,7 +446,7 @@ aws dynamodb put-item --table-name "$CHAT_TABLE" --region "$REGION" --item '{
   "userSuspended":  {"BOOL": false}
 }'
 
-aws dynamodb put-item --table-name "$SUB_TABLE" --region "$REGION" --item '{
+aws dynamodb put-item --table-name "$SUB_TABLE" --region "$REGION" --profile "$PROFILE" --item '{
   "PK":       {"S": "SUBSCRIPTION#test-sub-'"$TENANT"'"},
   "SK":       {"S": "METADATA"},
   "tenantId": {"S": "'"$TENANT"'"},
@@ -404,6 +476,34 @@ These rules apply to all generated backend code. Enforce them before writing any
 not update a counter, set a timestamp, or write any attribute as a side effect. Any mutation
 belongs in an explicit write function called separately by the service layer.
 
+**Use flat relative imports — never package-prefixed imports.**
+SAM zips each function's `CodeUri` directory to the root of the Lambda zip. A file at
+`src/session_token/domain.py` lands at `domain.py` in the zip root — there is no
+`session_token/` package. Package-prefixed imports like `from session_token.domain import ...`
+always fail with `No module named 'session_token'`. Use flat imports:
+```python
+# Correct
+from domain import validate_origin, build_jwt_claims, build_cors_headers
+from adapters import dynamo, sqs
+from services import bedrock as bedrock_svc
+
+# Wrong — breaks at runtime
+from session_token.domain import validate_origin
+from chat_api.adapters import dynamo
+```
+
+**Bundle third-party packages directly into source directories — do not rely on `requirements.txt`.**
+SAM ≥1.119 on x86_64 building `arm64` functions silently drops pip dependencies from the
+uploaded S3 zip (the local `.aws-sam/build/` directory is correct but the zip is truncated).
+Install directly into the source directory before `sam build`:
+```bash
+pip3 install PyJWT -t backend/src/session_token/
+pip3 install PyJWT -t backend/src/authorizer/
+```
+Then remove `requirements.txt` from those directories — `sam build` uses `requirements.txt`
+as the signal to invoke pip, and having both causes conflicts. This is only needed for
+functions that use `Architectures: [arm64]` on a non-arm64 build host.
+
 **Module-scope caching for AWS clients and secrets.**
 Initialise `boto3` clients and SecretsManager values once at module scope, not inside the
 handler function. Lambda reuses the execution environment across warm invocations — per-request
@@ -429,8 +529,12 @@ def lambda_handler(event, context):
   safe access throughout, never direct key access that raises KeyError
 - Return Deny if config missing, tenant archived, or tenant suspended
 - `validate_origin`: strip scheme + www, check exact match or subdomain suffix against `allowedDomains`
-- Return Allow policy with `context={"tenantId": tenant_id}` or Deny policy
-- `build_policy` helper returns `{"principalId", "policyDocument": {"Version", "Statement"}}`
+- Return Allow with `resolverContext={"tenantId": tenant_id}` or Deny
+- `build_policy` returns **AppSync Lambda Authorizer format**:
+  `{"isAuthorized": bool, "resolverContext": dict}` — NOT the API Gateway IAM policy format.
+  AppSync rejects `{"principalId", "policyDocument": {...}}` silently with 401 Unauthorized.
+  The AppSync Lambda Authorizer event contains `authorizationToken` and `requestContext` —
+  there is no `methodArn` field (that is API Gateway-only).
 
 ### Lambda: session_token/handler.py — full implementation
 
@@ -438,7 +542,11 @@ This is the only REST endpoint in the architecture. The widget calls it on start
 before opening the AppSync WebSocket. It is the control-plane equivalent for readers who do not
 have a separate backend service.
 
-- HTTP API Gateway (not REST API): `POST /session`, OPTIONS for CORS preflight
+- HTTP API Gateway (not REST API): `POST /session` only
+- Do NOT define an explicit OPTIONS event route in the SAM template. `CorsConfiguration` on
+  `AWS::Serverless::HttpApi` handles OPTIONS preflight automatically — but only when no explicit
+  OPTIONS route is defined. An explicit `OPTIONS` event overrides this and routes preflight to
+  Lambda, which crashes with HTTP 500 (unexpected event shape, no body).
 - Request body: `{ "tenantId": "..." }`
 - Read `Origin` header (case-insensitive — HTTP API Gateway normalises headers to lowercase)
 - Load CONFIG from DynamoDB (`PK=TENANT#{tenant_id}`, `SK=CONFIG`) using `.get()` throughout —
@@ -519,6 +627,38 @@ Generate complete handlers using the Bedrock `converse` API.
   *(Subscription and domain checks must run on every request — do not cache the result.)*
 - `XrayEnabled: true`
 - `LogConfig`: ERROR level, CloudWatch role
+
+**Compute stack Outputs — emit these exactly:**
+```yaml
+Outputs:
+  AppSyncGraphQLUrl:
+    Value: !GetAtt ChatApi.GraphQLUrl
+
+  AppSyncRealtimeUrl:
+    Value: !GetAtt ChatApi.RealtimeUrl
+    # AWS::AppSync::GraphQLApi.RealtimeUrl already returns the full wss:// URL including /graphql suffix.
+    # WRONG: !Sub "wss://${ChatApi.RealtimeUrl}/graphql"  ← doubles scheme AND path suffix
+
+  SessionTokenApiUrl:
+    Value: !Sub "https://${SessionTokenApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/session"
+
+  AppSyncApiId:
+    Value: !GetAtt ChatApi.ApiId
+```
+
+**Bedrock InvokeModel IAM — use `Resource: "*"` for InvokeModel actions.**
+Cross-region inference profiles (`us.amazon.nova-2-lite-v1:0`) route through the base
+foundation model ARN (`amazon.nova-2-lite-v1:0`). The IAM authorization check resolves to the
+foundation model ARN at runtime. Granting the inference profile ARN or a wildcard on
+`inference-profile/*` is not sufficient. The only safe approach is `Resource: "*"` for
+`bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`:
+```yaml
+- Effect: Allow
+  Action:
+    - bedrock:InvokeModel
+    - bedrock:InvokeModelWithResponseStream
+  Resource: "*"
+```
 
 ### WAF WebACL (`full` scope only)
 
@@ -756,29 +896,43 @@ DEPLOY ORDER (core) — 4 steps:
    artifacts bucket. All resources — including the Bedrock Knowledge Base and JWT secret —
    are provisioned automatically. No console steps needed.
 
-   ⚠️  OpenSearch Serverless collection creation takes 3–5 minutes. SAM waits for it.
+   ⚠️  First deploy takes ~8 minutes — AOSS collection creation (~5 min) followed by
+       automatic vector index creation via Lambda custom resource (~1 min). SAM waits for both.
    ⚠️  Note the stack name — you will pass it to the seed script in step 4.
 
 2. Deploy the compute layer (Lambda + AppSync + HTTP API Gateway):
 
-   sam build --template backend/templates/sam_template.yml
+   ⚠️  BEFORE sam build — pre-bundle PyJWT into the two function source directories.
+   SAM building arm64 functions on an x86_64 host silently drops pip-installed packages
+   from the Lambda zip (known SAM ≥1.100 bug). Bundling directly sidesteps this:
+
+   pip3 install PyJWT -t backend/src/session_token/ --quiet
+   pip3 install PyJWT -t backend/src/authorizer/ --quiet
+   rm -f backend/src/session_token/requirements.txt backend/src/authorizer/requirements.txt
+
+   Then build and deploy:
+
+   sam build --template backend/templates/sam_template.yml --no-cached
    sam deploy --guided --template backend/templates/sam_template.yml
 
    SAM will prompt for stack name (e.g. {project}-{env}-compute). When asked for parameter
    values, the compute stack reads JWT secret ARN and KB ID from SSM automatically — no
    manual copy-paste of ARNs needed.
 
+   If you are using a named AWS profile (not the default), pass --profile to sam deploy:
+   sam deploy --guided --template backend/templates/sam_template.yml --profile {your-profile}
+
 3. Populate widget/config.json from stack outputs:
 
    chmod +x scripts/update-config.sh
-   ./scripts/update-config.sh {project}-{env}-compute
+   ./scripts/update-config.sh {project}-{env}-compute us-east-1 {your-profile}
 
    This writes the three AppSync/SessionToken URLs into widget/config.json in one command.
 
 4. Seed test data and verify locally:
 
    chmod +x scripts/seed-tenant.sh
-   ./scripts/seed-tenant.sh {project}-{env}-infra
+   ./scripts/seed-tenant.sh {project}-{env}-infra test-tenant-id us-east-1 {your-profile}
 
    Then start the local server:
    cd widget && python -m http.server 8080
