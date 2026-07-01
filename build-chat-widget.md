@@ -274,13 +274,23 @@ d3. IndexCreatorFunction  (AWS::Lambda::Function — NOT AWS::Serverless::Functi
       Returns SUCCESS if index already exists (idempotent).
     → On Update/Delete: returns SUCCESS immediately (no-op — never delete the index on stack delete).
 
+    ⚠️  Do NOT import cfnresponse. SAM (Transform: AWS::Serverless-2016-10-31) packages the
+      ZipFile code into a regular S3 zip before CloudFormation sees it. CloudFormation only
+      injects cfnresponse for raw ZipFile deployments — not for packaged zips. The result
+      is Runtime.ImportModuleError: No module named 'cfnresponse' at invocation time.
+      Instead, implement a self-contained _cfn() helper that PUTs directly to event['ResponseURL'].
+
     Inline code (verbatim — emit this exactly inside Code.ZipFile):
-      import json,os,time,hashlib,cfnresponse,urllib.request as ur,urllib.error as ue,boto3
+      import json,os,time,hashlib,urllib.request as ur,urllib.error as ue,boto3
       from botocore.auth import SigV4Auth
       from botocore.awsrequest import AWSRequest
+      def _cfn(event,ctx,status,data=None):
+        body=json.dumps({'Status':status,'Reason':f'See {ctx.log_stream_name}','PhysicalResourceId':ctx.log_stream_name,'StackId':event['StackId'],'RequestId':event['RequestId'],'LogicalResourceId':event['LogicalResourceId'],'Data':data or{}}).encode()
+        req=ur.Request(method='PUT',url=event['ResponseURL'],data=body,headers={'content-type':'','content-length':str(len(body))})
+        ur.urlopen(req,timeout=30)
       def handler(event,ctx):
         if event['RequestType']!='Create':
-          cfnresponse.send(event,ctx,cfnresponse.SUCCESS,{});return
+          _cfn(event,ctx,'SUCCESS');return
         try:
           p=event['ResourceProperties']
           url=f"{p['CollectionEndpoint'].rstrip('/')}/{p['IndexName']}"
@@ -304,10 +314,10 @@ d3. IndexCreatorFunction  (AWS::Lambda::Function — NOT AWS::Serverless::Functi
             except Exception as e:last=e
             if i<5:time.sleep(10)
           if last:raise last
-          cfnresponse.send(event,ctx,cfnresponse.SUCCESS,{})
+          _cfn(event,ctx,'SUCCESS')
         except Exception as e:
           import traceback;print(traceback.format_exc())
-          cfnresponse.send(event,ctx,cfnresponse.FAILED,{'Error':str(e)})
+          _cfn(event,ctx,'FAILED',{'Error':str(e)})
 
 e. DataAccessPolicy  (Type: data)
    → Grants BOTH BedrockKBRole AND IndexCreatorRole: aoss:CreateIndex, DescribeIndex,
