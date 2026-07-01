@@ -896,6 +896,11 @@ DEPLOY ORDER (core) — 4 steps:
    artifacts bucket. All resources — including the Bedrock Knowledge Base and JWT secret —
    are provisioned automatically. No console steps needed.
 
+   When SAM asks "Allow SAM CLI IAM role creation [Y/n]" — answer Y. Both stacks create
+   named IAM roles (BedrockKBRole, IndexCreatorRole, AppSyncLoggingRole, etc.), so
+   CAPABILITY_NAMED_IAM is required. SAM handles this automatically in --guided mode.
+   For non-interactive / CI deploys, pass --capabilities CAPABILITY_NAMED_IAM explicitly.
+
    ⚠️  First deploy takes ~8 minutes — AOSS collection creation (~5 min) followed by
        automatic vector index creation via Lambda custom resource (~1 min). SAM waits for both.
    ⚠️  Note the stack name — you will pass it to the seed script in step 4.
@@ -917,7 +922,8 @@ DEPLOY ORDER (core) — 4 steps:
 
    SAM will prompt for stack name (e.g. {project}-{env}-compute). When asked for parameter
    values, the compute stack reads JWT secret ARN and KB ID from SSM automatically — no
-   manual copy-paste of ARNs needed.
+   manual copy-paste of ARNs needed. Answer Y to the IAM role creation prompt (same reason
+   as the infra stack — named IAM roles require CAPABILITY_NAMED_IAM).
 
    If you are using a named AWS profile (not the default), pass --profile to sam deploy:
    sam deploy --guided --template backend/templates/sam_template.yml --profile {your-profile}
