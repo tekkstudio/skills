@@ -502,17 +502,11 @@ from session_token.domain import validate_origin
 from chat_api.adapters import dynamo
 ```
 
-**Bundle third-party packages directly into source directories — do not rely on `requirements.txt`.**
-SAM ≥1.119 on x86_64 building `arm64` functions silently drops pip dependencies from the
-uploaded S3 zip (the local `.aws-sam/build/` directory is correct but the zip is truncated).
-Install directly into the source directory before `sam build`:
-```bash
-pip3 install PyJWT -t backend/src/session_token/
-pip3 install PyJWT -t backend/src/authorizer/
-```
-Then remove `requirements.txt` from those directories — `sam build` uses `requirements.txt`
-as the signal to invoke pip, and having both causes conflicts. This is only needed for
-functions that use `Architectures: [arm64]` on a non-arm64 build host.
+**Use `Architectures: [x86_64]` in the SAM Globals block — not `arm64`.**
+SAM building `arm64` functions on an x86_64 host silently drops pip-installed packages from
+the Lambda zip (confirmed open bug as of 2025; `--use-container` has its own issues and is not
+a reliable workaround). `x86_64` builds reliably without any pre-bundling step. The price
+difference is negligible at low volume (~20% per GB-second) and not worth the operational burden.
 
 **Module-scope caching for AWS clients and secrets.**
 Initialise `boto3` clients and SecretsManager values once at module scope, not inside the
@@ -917,15 +911,7 @@ DEPLOY ORDER (core) — 4 steps:
 
 2. Deploy the compute layer (Lambda + AppSync + HTTP API Gateway):
 
-   ⚠️  BEFORE sam build — pre-bundle PyJWT into the two function source directories.
-   SAM building arm64 functions on an x86_64 host silently drops pip-installed packages
-   from the Lambda zip (known SAM ≥1.100 bug). Bundling directly sidesteps this:
-
-   pip3 install PyJWT -t backend/src/session_token/ --quiet
-   pip3 install PyJWT -t backend/src/authorizer/ --quiet
-   rm -f backend/src/session_token/requirements.txt backend/src/authorizer/requirements.txt
-
-   Then build and deploy:
+   Build and deploy:
 
    sam build --template backend/templates/sam_template.yml --no-cached
    sam deploy --guided --template backend/templates/sam_template.yml
