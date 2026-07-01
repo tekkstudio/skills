@@ -299,7 +299,7 @@ d3. IndexCreatorFunction  (AWS::Lambda::Function — NOT AWS::Serverless::Functi
             p['TextField']:{"type":"text","index":True},
             p['MetadataField']:{"type":"text","index":False}}}}).encode()
           last=None
-          for i in range(6):
+          for i in range(12):
             try:
               sha256=hashlib.sha256(body).hexdigest()
               r=AWSRequest(method='PUT',url=url,data=body,headers={'Content-Type':'application/json','x-amz-content-sha256':sha256})
@@ -312,7 +312,7 @@ d3. IndexCreatorFunction  (AWS::Lambda::Function — NOT AWS::Serverless::Functi
               if e.code==400 and b'resource_already_exists' in d:last=None;break
               last=e
             except Exception as e:last=e
-            if i<5:time.sleep(10)
+            if i<11:time.sleep(10)
           if last:raise last
           _cfn(event,ctx,'SUCCESS')
         except Exception as e:
